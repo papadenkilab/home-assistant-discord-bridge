@@ -1,5 +1,5 @@
 name: "Discord Bridge"
-version: "1.0.0"
+version: "1.1.0"
 slug: "discord_bridge"
 description: "Discord gateway bridge for Home Assistant: queues allowed users' messages from any channel of an invited server, posts replies, and exposes a management API gated by the bot's Discord permissions. An external assistant polls the queue over a small HTTP API."
 url: "https://github.com/papadenkilab/home-assistant-discord-bridge"

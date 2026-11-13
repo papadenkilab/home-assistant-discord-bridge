@@ -311,3 +311,65 @@ async def test_api_refuses_when_queue_token_empty(tmp_path):
     async with TestClient(TestServer(app)) as c:
         r = await c.get("/pending")
         assert r.status == 503
+
+
+# ---------------- inbound attachments ----------------
+
+ATT = {"index": 0, "filename": "photo.jpg", "content_type": "image/jpeg",
+       "size": 4, "url": "https://cdn.example/photo.jpg",
+       "downloaded": False}
+
+
+def test_queue_attachments_roundtrip(tmp_path):
+    q = bridge_mod.Queue(str(tmp_path / "q.db"))
+    assert q.insert_message("m9", CHAN, USER, "", attachments=[ATT])
+    items = q.fetch_pending()
+    assert items[0]["content"] == ""
+    assert items[0]["attachments"][0]["filename"] == "photo.jpg"
+
+
+def test_safe_filename():
+    assert bridge_mod.safe_filename("../../etc/passwd") == "passwd"
+    assert bridge_mod.safe_filename("my photo!.png") == "my_photo_.png"
+    assert bridge_mod.safe_filename("") == "attachment"
+
+
+async def test_attachment_download_endpoint(tmp_path):
+    q = bridge_mod.Queue(str(tmp_path / "q.db"))
+    q.insert_message("m10", CHAN, USER, "with file", attachments=[ATT])
+    stored = q.save_attachment_bytes("m10", 0, "photo.jpg", b"JPEG")
+    entry = dict(ATT, downloaded=True, stored_name=stored)
+    q.set_attachments("m10", [entry])
+    b = bridge_mod.Bridge(make_cfg(), q)
+    app = bridge_mod.create_app(b)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.get("/attachments/m10/0")
+        assert r.status == 401
+        r = await c.get("/attachments/m10/0",
+                        headers={"X-Queue-Token": TOKEN})
+        assert r.status == 200
+        assert await r.read() == b"JPEG"
+        assert r.headers["Content-Type"].startswith("image/jpeg")
+        r = await c.get("/attachments/m10/3",
+                        headers={"X-Queue-Token": TOKEN})
+        assert r.status == 404
+        r = await c.get("/attachments/nope/0",
+                        headers={"X-Queue-Token": TOKEN})
+        assert r.status == 404
+
+
+def test_cleanup_removes_attachment_files(tmp_path):
+    q = bridge_mod.Queue(str(tmp_path / "q.db"))
+    q.insert_message("m11", CHAN, USER, "old", attachments=[ATT])
+    stored = q.save_attachment_bytes("m11", 0, "photo.jpg", b"JPEG")
+    q.set_attachments("m11", [dict(ATT, downloaded=True,
+                                   stored_name=stored)])
+    folder = tmp_path / "attachments" / "m11"
+    assert folder.is_dir()
+    item = q.fetch_pending()[0]
+    assert q.ack([item["id"]]) == 1
+    q.conn.execute(
+        "UPDATE messages SET acked_at='2020-01-01T00:00:00+00:00'")
+    q.conn.commit()
+    assert q.cleanup(7) == 1
+    assert not folder.exists()

@@ -16,6 +16,11 @@ Endpoints:
                                   dedupe_id, file (one attachment, max
                                   25 MB), content? (optional text),
                                   in_reply_to?
+  GET  /attachments/{message_id}/{index}
+                       token    - download one stored inbound attachment
+
+Inbound attachments (images/files on queued messages) are downloaded
+to the data directory (25 MB per-file cap) and listed in /pending.
 
 Management (all token auth). What these can actually do is limited by
 the bot's Discord permissions; a missing permission comes back as 403:
@@ -49,13 +54,16 @@ import hmac
 import json
 import logging
 import os
+import re
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DISCORD_LIMIT = 2000
 # Discord's per-file upload cap for bots in normal channels is 25 MB.
 MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -147,10 +155,19 @@ def split_content(text, limit=DISCORD_LIMIT):
 
 # ---------------------------------------------------------------- queue
 
+def safe_filename(name):
+    base = os.path.basename(str(name or "attachment"))
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "attachment"
+    return base[:100]
+
+
 class Queue:
     def __init__(self, db_path):
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        data_dir = os.path.dirname(db_path) or "."
+        os.makedirs(data_dir, exist_ok=True)
+        self.attachments_dir = os.path.join(data_dir, "attachments")
+        os.makedirs(self.attachments_dir, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(
@@ -164,7 +181,8 @@ class Queue:
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 fetched_at TEXT,
-                acked_at TEXT
+                acked_at TEXT,
+                attachments TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS outbox (
                 dedupe_id TEXT UNIQUE NOT NULL,
@@ -180,20 +198,57 @@ class Queue:
             );
             """
         )
+        # Migration for databases created before attachments existed.
+        cols = [r[1] for r in self.conn.execute(
+            "PRAGMA table_info(messages)").fetchall()]
+        if "attachments" not in cols:
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN"
+                " attachments TEXT NOT NULL DEFAULT '[]'")
         self.conn.commit()
         self.lock = asyncio.Lock()
 
-    def insert_message(self, discord_message_id, channel_id, author_id, content, created_at=None):
+    def insert_message(self, discord_message_id, channel_id, author_id, content, created_at=None, attachments=None):
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages"
-            " (discord_message_id, channel_id, author_id, content, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
+            " (discord_message_id, channel_id, author_id, content, created_at, attachments)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             (str(discord_message_id), str(channel_id), str(author_id),
-             content, created_at or utcnow()),
+             content, created_at or utcnow(),
+             json.dumps(attachments or [])),
         )
         self.conn.commit()
         self.set_meta("last_message_at", utcnow())
         return cur.rowcount == 1
+
+    def set_attachments(self, discord_message_id, attachments):
+        self.conn.execute(
+            "UPDATE messages SET attachments=? WHERE discord_message_id=?",
+            (json.dumps(attachments), str(discord_message_id)),
+        )
+        self.conn.commit()
+
+    def get_attachments(self, discord_message_id):
+        row = self.conn.execute(
+            "SELECT attachments FROM messages WHERE discord_message_id=?",
+            (str(discord_message_id),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0] or "[]")
+        except ValueError:
+            return []
+
+    def attachment_path(self, discord_message_id, index, filename):
+        folder = Path(self.attachments_dir) / str(discord_message_id)
+        return folder / ("%d-%s" % (int(index), safe_filename(filename)))
+
+    def save_attachment_bytes(self, discord_message_id, index, filename, data):
+        path = self.attachment_path(discord_message_id, index, filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path.name
 
     def pending_count(self):
         row = self.conn.execute(
@@ -203,7 +258,7 @@ class Queue:
 
     def fetch_pending(self, limit=50):
         rows = self.conn.execute(
-            "SELECT id, discord_message_id, channel_id, author_id, content, created_at"
+            "SELECT id, discord_message_id, channel_id, author_id, content, created_at, attachments"
             " FROM messages WHERE status IN ('pending', 'fetched')"
             " ORDER BY id ASC LIMIT ?",
             (limit,),
@@ -216,11 +271,17 @@ class Queue:
                 [utcnow()] + ids,
             )
             self.conn.commit()
-        return [
-            {"id": r[0], "discord_message_id": r[1], "channel_id": r[2],
-             "author_id": r[3], "content": r[4], "created_at": r[5]}
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            try:
+                atts = json.loads(r[6] or "[]")
+            except ValueError:
+                atts = []
+            out.append(
+                {"id": r[0], "discord_message_id": r[1], "channel_id": r[2],
+                 "author_id": r[3], "content": r[4], "created_at": r[5],
+                 "attachments": atts})
+        return out
 
     def ack(self, ids):
         done = 0
@@ -262,12 +323,21 @@ class Queue:
         return row[0] if row else default
 
     def cleanup(self, retention_days):
+        rows = self.conn.execute(
+            "SELECT discord_message_id FROM messages WHERE status='done'"
+            " AND acked_at < datetime('now', ?)",
+            ("-%d days" % int(retention_days),),
+        ).fetchall()
         cur = self.conn.execute(
             "DELETE FROM messages WHERE status='done'"
             " AND acked_at < datetime('now', ?)",
             ("-%d days" % int(retention_days),),
         )
         self.conn.commit()
+        for (mid,) in rows:
+            shutil.rmtree(
+                os.path.join(self.attachments_dir, str(mid)),
+                ignore_errors=True)
         return cur.rowcount
 
 
@@ -518,6 +588,31 @@ def create_app(bridge):
             {"sent_message_id": sent_id, "status": "sent",
              "filename": filename, "size": len(data)})
 
+    @require_token(bridge)
+    async def attachment_file(request):
+        """GET /attachments/{message_id}/{index} - one stored file."""
+        message_id = request.match_info["message_id"]
+        try:
+            index = int(request.match_info["index"])
+        except ValueError:
+            return web.json_response({"error": "bad index"}, status=400)
+        atts = q.get_attachments(message_id)
+        if atts is None:
+            return web.json_response(
+                {"error": "message not found"}, status=404)
+        entry = next((a for a in atts if a.get("index") == index), None)
+        if entry is None or not entry.get("stored_name"):
+            return web.json_response(
+                {"error": "attachment not stored"}, status=404)
+        path = Path(q.attachments_dir) / message_id / entry["stored_name"]
+        if not path.is_file():
+            return web.json_response(
+                {"error": "attachment file missing"}, status=404)
+        return web.FileResponse(
+            path,
+            headers={"Content-Type": entry.get("content_type")
+                     or "application/octet-stream"})
+
     # ---------------- management API ----------------
     # Everything below is gated only by the bot's Discord permissions:
     # discord.py raises Forbidden when the bot's role (or a channel
@@ -608,6 +703,10 @@ def create_app(bridge):
                 "created_at": m.created_at.isoformat()
                 if m.created_at else None,
                 "pinned": m.pinned,
+                "attachments": [
+                    {"filename": a.filename,
+                     "content_type": a.content_type, "size": a.size}
+                    for a in m.attachments],
             })
         return web.json_response({"messages": out})
 
@@ -789,6 +888,7 @@ def create_app(bridge):
     app.router.add_post("/ack", ack)
     app.router.add_post("/send", send)
     app.router.add_post("/send_file", send_file)
+    app.router.add_get("/attachments/{message_id}/{index}", attachment_file)
     app.router.add_get("/guilds", guilds)
     app.router.add_get("/channels", channels)
     app.router.add_get("/members", members)
@@ -842,15 +942,45 @@ def build_discord_client(bridge):
                           message.author.id == client.user.id,
                           cfg["allowed_user_id"], cfg["allowed_guild_ids"]):
             return
+        atts = [
+            {"index": i, "filename": a.filename,
+             "content_type": a.content_type, "size": a.size,
+             "url": a.url, "downloaded": False}
+            for i, a in enumerate(message.attachments)
+        ]
         inserted = q.insert_message(
             message.id, message.channel.id, message.author.id,
             message.content,
             created_at=message.created_at.isoformat()
-            if message.created_at else None)
+            if message.created_at else None,
+            attachments=atts)
         q.set_meta("last_seen_%s" % message.channel.id, str(message.id))
         if inserted:
-            log.info("queued message id=%s channel=%s len=%d",
-                     message.id, message.channel.id, len(message.content))
+            log.info("queued message id=%s channel=%s len=%d attachments=%d",
+                     message.id, message.channel.id, len(message.content),
+                     len(atts))
+            # Download the attachment bytes so the poller can fetch
+            # them later via /attachments/... (Discord CDN URLs expire).
+            changed = False
+            for entry, att in zip(atts, message.attachments):
+                if att.size and att.size > MAX_FILE_SIZE:
+                    entry["note"] = "too large to store"
+                    changed = True
+                    continue
+                try:
+                    path = q.attachment_path(
+                        message.id, entry["index"], entry["filename"])
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    await att.save(path)
+                    entry["downloaded"] = True
+                    entry["stored_name"] = path.name
+                except Exception as exc:
+                    entry["note"] = "download failed: %s" % exc
+                    log.warning("attachment download failed id=%s: %s",
+                                message.id, exc)
+                changed = True
+            if changed:
+                q.set_attachments(message.id, atts)
             try:
                 await message.add_reaction("👀")
             except Exception as exc:

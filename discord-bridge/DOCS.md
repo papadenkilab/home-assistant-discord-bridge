@@ -55,6 +55,7 @@ Bot ロールのチャンネル権限で行ってください）。
 トークン認証（ヘッダ `X-Queue-Token`）:
 
 - キュー: `GET /pending`、`POST /ack`、`POST /send`、`POST /send_file`（ファイル添付送信、1ファイル最大25MB）
+- 受信添付: キュー対象メッセージに付いたファイルはアドオンのデータ領域に保存され（1ファイル最大25MB）、`GET /pending` の `attachments` に一覧が出ます。本体は `GET /attachments/{message_id}/{index}` で取得します。保存済みファイルは保持期間クリーンアップでメッセージと一緒に削除されます
 - 参照: `GET /guilds`、`GET /channels`、`GET /members`、`GET /roles`、`GET /history`
 - 管理: `POST /channels/create`、`/channels/edit`、`/channels/delete`、
   `/messages/delete`、`/messages/bulk_delete`、`/messages/pin`、`/messages/unpin`、
