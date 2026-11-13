@@ -1,3 +1,10 @@
+## 1.2.0
+
+- Forum channels: `POST /send` and `POST /send_file` now create a
+  forum post (thread) when the target channel is a forum channel,
+  instead of failing. The post title comes from the new optional
+  `title` field, or from the first line of the content.
+
 ## 1.1.0
 
 - Inbound attachments: files attached to queued messages are now

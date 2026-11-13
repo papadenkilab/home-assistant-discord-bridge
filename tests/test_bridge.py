@@ -373,3 +373,13 @@ def test_cleanup_removes_attachment_files(tmp_path):
     q.conn.commit()
     assert q.cleanup(7) == 1
     assert not folder.exists()
+
+
+# ---------------- forum posts ----------------
+
+def test_forum_post_title():
+    assert bridge_mod.forum_post_title("hello world\nsecond line") == "hello world"
+    assert bridge_mod.forum_post_title("\n\n  \nactual title\nbody") == "actual title"
+    assert bridge_mod.forum_post_title("body", title="Explicit") == "Explicit"
+    assert bridge_mod.forum_post_title("") == "post"
+    assert len(bridge_mod.forum_post_title("x" * 150)) == 100

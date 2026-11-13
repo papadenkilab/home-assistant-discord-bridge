@@ -11,11 +11,16 @@ Endpoints:
   GET  /pending_count  no auth  - {"count": n} only
   GET  /pending        token    - pending messages (marks them fetched)
   POST /ack            token    - {"ids": [...]} mark processed
-  POST /send           token    - {channel_id, content, dedupe_id, in_reply_to?}
+  POST /send           token    - {channel_id, content, dedupe_id,
+                                  in_reply_to?, title?}
   POST /send_file      token    - multipart/form-data: channel_id,
                                   dedupe_id, file (one attachment, max
                                   25 MB), content? (optional text),
-                                  in_reply_to?
+                                  in_reply_to?, title?
+
+  When channel_id is a forum channel, /send and /send_file create a
+  forum post (thread) instead of a plain message: `title` becomes the
+  post title (default: the first line of the content).
   GET  /attachments/{message_id}/{index}
                        token    - download one stored inbound attachment
 
@@ -63,7 +68,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DISCORD_LIMIT = 2000
 # Discord's per-file upload cap for bots in normal channels is 25 MB.
 MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -151,6 +156,23 @@ def split_content(text, limit=DISCORD_LIMIT):
     if rest:
         chunks.append(rest)
     return chunks
+
+
+def forum_post_title(content, title=None):
+    """Title for a forum post: explicit title, else the content's
+    first non-empty line, else a generic fallback. Discord caps
+    thread names at 100 characters."""
+    if title and str(title).strip():
+        name = str(title).strip()
+    else:
+        name = ""
+        for line in str(content or "").splitlines():
+            if line.strip():
+                name = line.strip()
+                break
+        if not name:
+            name = "post"
+    return name[:100]
 
 
 # ---------------------------------------------------------------- queue
@@ -354,13 +376,32 @@ class Bridge:
     def discord_connected(self):
         return bool(self.client and self.client.is_ready())
 
-    async def send_to_discord(self, channel_id, content, in_reply_to=None):
-        """Returns the last sent message id (str). Raises if not connected."""
+    async def send_to_discord(self, channel_id, content, in_reply_to=None,
+                              title=None):
+        """Returns the last sent message id (str). Raises if not connected.
+
+        Forum channels have no plain send: the content becomes a new
+        forum post whose title is `title` or the first content line.
+        """
+        import discord
+
         if not self.discord_connected():
             raise RuntimeError("discord client not connected")
         channel = self.client.get_channel(int(channel_id))
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
+        if isinstance(channel, discord.ForumChannel):
+            chunks = split_content(content)
+            created = await channel.create_post(
+                name=forum_post_title(content, title),
+                content=chunks[0] if chunks else "")
+            thread = created.thread
+            last_id = str(created.message.id) if created.message \
+                else str(thread.id)
+            for chunk in chunks[1:]:
+                msg = await thread.send(chunk)
+                last_id = str(msg.id)
+            return last_id
         last_id = None
         for chunk in split_content(content):
             msg = await channel.send(chunk)
@@ -374,12 +415,13 @@ class Bridge:
         return last_id
 
     async def send_file_to_discord(self, channel_id, content, filename,
-                                   data, in_reply_to=None):
+                                   data, in_reply_to=None, title=None):
         """Send one file attachment, with optional text alongside.
 
         Returns the sent message id (str). Raises if not connected.
         The file rides on the last text chunk when the content has to
-        be split, so the message order matches /send.
+        be split, so the message order matches /send. Forum channels
+        get a new forum post carrying the file instead.
         """
         import io
 
@@ -390,6 +432,15 @@ class Bridge:
         channel = self.client.get_channel(int(channel_id))
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
+        if isinstance(channel, discord.ForumChannel):
+            attach = discord.File(io.BytesIO(data),
+                                  filename=os.path.basename(filename)
+                                  or "attachment")
+            created = await channel.create_post(
+                name=forum_post_title(content, title),
+                content=content or None, file=attach)
+            return str(created.message.id) if created.message \
+                else str(created.thread.id)
         chunks = split_content(content) if content else []
         last_id = None
         for chunk in chunks[:-1]:
@@ -492,6 +543,7 @@ def create_app(bridge):
         content = body.get("content", "")
         dedupe_id = body.get("dedupe_id", "")
         in_reply_to = body.get("in_reply_to")
+        title = body.get("title")
         if not channel_id or not content or not dedupe_id:
             return web.json_response(
                 {"error": "channel_id, content and dedupe_id are required"},
@@ -510,7 +562,8 @@ def create_app(bridge):
             q.outbox_put(dedupe_id, channel_id, content, fake_id, status="simulated")
             return web.json_response(
                 {"sent_message_id": fake_id, "status": "simulated"})
-        sent_id = await bridge.send_to_discord(channel_id, content, in_reply_to)
+        sent_id = await bridge.send_to_discord(
+            channel_id, content, in_reply_to, title=title)
         q.outbox_put(dedupe_id, channel_id, content, sent_id, status="sent")
         return web.json_response({"sent_message_id": sent_id, "status": "sent"})
 
@@ -521,7 +574,8 @@ def create_app(bridge):
         Fields: channel_id (required), dedupe_id (required),
         file (required, one file, at most MAX_FILE_SIZE bytes),
         content (optional text sent with the file), in_reply_to
-        (optional). Dedupe/outbox handling matches /send.
+        (optional), title (optional; forum post title when the
+        channel is a forum). Dedupe/outbox handling matches /send.
         """
         if not request.content_type.startswith("multipart/"):
             return web.json_response(
@@ -551,7 +605,7 @@ def create_app(bridge):
                                 status=400)
                     data = bytes(buf)
                 elif part.name in ("channel_id", "content", "dedupe_id",
-                                   "in_reply_to"):
+                                   "in_reply_to", "title"):
                     fields[part.name] = (await part.text()).strip()
         except web.HTTPRequestEntityTooLarge:
             return web.json_response(
@@ -582,7 +636,8 @@ def create_app(bridge):
                 {"sent_message_id": fake_id, "status": "simulated",
                  "filename": filename, "size": len(data)})
         sent_id = await bridge.send_file_to_discord(
-            channel_id, content, filename, data, in_reply_to)
+            channel_id, content, filename, data, in_reply_to,
+            title=fields.get("title") or None)
         q.outbox_put(dedupe_id, channel_id, content, sent_id, status="sent")
         return web.json_response(
             {"sent_message_id": sent_id, "status": "sent",
