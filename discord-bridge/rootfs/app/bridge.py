@@ -31,6 +31,9 @@ Management (all token auth). What these can actually do is limited by
 the bot's Discord permissions; a missing permission comes back as 403:
   GET  /guilds                   - guilds the bot belongs to
   GET  /channels?guild_id=       - channels (optionally one guild)
+  GET  /threads?guild_id=        - active threads + archived forum
+                                   posts (forum posts are threads);
+                                   read one with /history?channel_id=
   GET  /members?guild_id=&limit= - guild members
   GET  /roles?guild_id=          - guild roles
   GET  /history?channel_id=&limit= - recent messages in a channel
@@ -68,7 +71,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DISCORD_LIMIT = 2000
 # Discord's per-file upload cap for bots in normal channels is 25 MB.
 MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -719,6 +722,51 @@ def create_app(bridge):
         return web.json_response({"channels": out})
 
     @mgmt
+    async def threads(request):
+        """Active threads plus archived forum posts.
+
+        Forum posts ARE threads whose parent is the forum channel, so
+        this is how forum content is enumerated; read a post's
+        messages with /history?channel_id=<thread id>.
+        """
+        import discord
+
+        guild_id = request.query.get("guild_id")
+        if guild_id:
+            targets = [await bridge.get_guild(guild_id)]
+        else:
+            targets = list(bridge.client.guilds)
+        out = []
+        seen = set()
+
+        def add(t, guild):
+            if t.id in seen:
+                return
+            seen.add(t.id)
+            out.append({
+                "id": str(t.id), "name": t.name,
+                "parent_id": str(t.parent_id) if t.parent_id else None,
+                "guild_id": str(guild.id),
+                "owner_id": str(t.owner_id) if t.owner_id else None,
+                "archived": bool(t.archived),
+                "created_at": discord.utils.snowflake_time(
+                    t.id).isoformat(),
+            })
+
+        for g in targets:
+            for t in await g.active_threads():
+                add(t, g)
+            for ch in g.channels:
+                if isinstance(ch, discord.ForumChannel):
+                    try:
+                        async for t in ch.archived_threads(limit=50):
+                            add(t, g)
+                    except Exception as exc:
+                        log.debug("archived threads skipped %s: %s",
+                                  ch.id, exc)
+        return web.json_response({"threads": out})
+
+    @mgmt
     async def members(request):
         guild_id = request.query.get("guild_id", "")
         if not guild_id:
@@ -760,7 +808,8 @@ def create_app(bridge):
                 "pinned": m.pinned,
                 "attachments": [
                     {"filename": a.filename,
-                     "content_type": a.content_type, "size": a.size}
+                     "content_type": a.content_type, "size": a.size,
+                     "url": a.url}
                     for a in m.attachments],
             })
         return web.json_response({"messages": out})
@@ -946,6 +995,7 @@ def create_app(bridge):
     app.router.add_get("/attachments/{message_id}/{index}", attachment_file)
     app.router.add_get("/guilds", guilds)
     app.router.add_get("/channels", channels)
+    app.router.add_get("/threads", threads)
     app.router.add_get("/members", members)
     app.router.add_get("/roles", roles)
     app.router.add_get("/history", history)

@@ -383,3 +383,10 @@ def test_forum_post_title():
     assert bridge_mod.forum_post_title("body", title="Explicit") == "Explicit"
     assert bridge_mod.forum_post_title("") == "post"
     assert len(bridge_mod.forum_post_title("x" * 150)) == 100
+
+
+async def test_threads_requires_token_and_connection(client):
+    r = await client.get("/threads")
+    assert r.status == 401
+    r = await client.get("/threads", headers={"X-Queue-Token": TOKEN})
+    assert r.status == 503

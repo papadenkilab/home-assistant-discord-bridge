@@ -1,3 +1,10 @@
+## 1.3.0
+
+- New `GET /threads` (token auth): lists active threads and archived
+  forum posts (forum posts are threads). Read a post's messages and
+  attachments with `GET /history?channel_id=<thread id>`.
+- `GET /history` attachment entries now include the CDN `url`.
+
 ## 1.2.0
 
 - Forum channels: `POST /send` and `POST /send_file` now create a
