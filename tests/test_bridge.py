@@ -403,3 +403,80 @@ def test_resolve_forum_tags():
     with pytest.raises(ValueError):
         bridge_mod.resolve_forum_tags(
             [("10", "重複"), ("11", "重複")], ["重複"])
+
+
+class _FakeTag:
+    def __init__(self, id, name):
+        self.id, self.name = id, name
+
+
+class _FakeMsg:
+    def __init__(self, id):
+        self.id = id
+
+
+def _fake_forum(calls):
+    import discord  # noqa: F401  (patched below by the tests)
+
+    class FakeThread:
+        id = 4242
+
+        async def send(self, content):
+            return _FakeMsg(4243)
+
+    class FakeCreated:
+        thread = FakeThread()
+        message = _FakeMsg(4242)
+
+    class FakeForum:
+        available_tags = [_FakeTag(10, "文書・記事"), _FakeTag(11, "画像")]
+
+        async def create_thread(self, **kwargs):
+            calls.update(kwargs)
+            return FakeCreated()
+
+    return FakeForum()
+
+
+def _forum_bridge(monkeypatch, forum):
+    import discord
+
+    class FakeClient:
+        def is_ready(self):
+            return True
+
+        def get_channel(self, cid):
+            return forum
+
+        async def fetch_channel(self, cid):
+            return forum
+
+    b = bridge_mod.Bridge(make_cfg(), None)
+    b.client = FakeClient()
+    monkeypatch.setattr(discord, "ForumChannel", type(forum))
+    return b
+
+
+async def test_send_to_forum_uses_create_thread_with_tags(monkeypatch):
+    calls = {}
+    forum = _fake_forum(calls)
+    b = _forum_bridge(monkeypatch, forum)
+    sent_id = await b.send_to_discord("999", "本文です", title="題名",
+                                      tags=["文書・記事"])
+    assert sent_id == "4242"
+    assert calls["name"] == "題名"
+    assert calls["content"] == "本文です"
+    assert [t.name for t in calls["applied_tags"]] == ["文書・記事"]
+
+
+async def test_send_file_to_forum_uses_create_thread(monkeypatch):
+    calls = {}
+    forum = _fake_forum(calls)
+    b = _forum_bridge(monkeypatch, forum)
+    sent_id = await b.send_file_to_discord(
+        "999", "説明", "a.txt", b"hello", title="ファイル題名",
+        tags=["画像"])
+    assert sent_id == "4242"
+    assert calls["name"] == "ファイル題名"
+    assert calls["file"].filename == "a.txt"
+    assert [t.name for t in calls["applied_tags"]] == ["画像"]

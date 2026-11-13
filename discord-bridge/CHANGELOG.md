@@ -1,3 +1,11 @@
+## 1.3.2
+
+- Fix forum posting: discord.py's ForumChannel has no `create_post`
+  method (that name does not exist in discord.py 2.4); use
+  `create_thread`, which is the actual API. This was the real cause
+  of the forum-create failures in 1.2.0-1.3.1 (previously hidden by
+  the bare HTTP 500). Covered by new fake-forum tests.
+
 ## 1.3.1
 
 - `/send` and `/send_file` now return Discord errors (403/404/502

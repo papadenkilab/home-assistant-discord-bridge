@@ -71,7 +71,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 DISCORD_LIMIT = 2000
 # Discord's per-file upload cap for bots in normal channels is 25 MB.
 MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -440,7 +440,7 @@ class Bridge:
             if applied:
                 kwargs["applied_tags"] = applied
             chunks = split_content(content)
-            created = await channel.create_post(
+            created = await channel.create_thread(
                 name=forum_post_title(content, title),
                 content=chunks[0] if chunks else "", **kwargs)
             thread = created.thread
@@ -489,7 +489,7 @@ class Bridge:
             attach = discord.File(io.BytesIO(data),
                                   filename=os.path.basename(filename)
                                   or "attachment")
-            created = await channel.create_post(
+            created = await channel.create_thread(
                 name=forum_post_title(content, title),
                 content=content or None, file=attach, **kwargs)
             return str(created.message.id) if created.message \
