@@ -1,0 +1,28 @@
+name: "Discord Bridge"
+version: "1.0.0"
+slug: "discord_bridge"
+description: "Discord gateway bridge for Home Assistant: queues allowed users' messages from any channel of an invited server, posts replies, and exposes a management API gated by the bot's Discord permissions. An external assistant polls the queue over a small HTTP API."
+url: "https://github.com/papadenkilab/home-assistant-discord-bridge"
+arch:
+  - aarch64
+  - amd64
+init: false
+boot: auto
+host_network: true
+ingress: false
+panel_icon: "mdi:message-text"
+startup: application
+options:
+  discord_token: ""
+  allowed_user_id: ""
+  allowed_guild_ids: ""
+  queue_token: ""
+  retention_days: 7
+  log_level: info
+schema:
+  discord_token: password
+  allowed_user_id: str
+  allowed_guild_ids: str
+  queue_token: password
+  retention_days: int(1,90)
+  log_level: list(debug|info|warning|error)

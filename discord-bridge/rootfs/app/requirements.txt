@@ -1,0 +1,5 @@
+discord.py==2.4.0
+# Python 3.13+ removed the stdlib `audioop` module, which discord.py
+# imports at module load (discord/player.py). audioop-lts is the
+# maintained backport and ships abi3 wheels covering 3.13 and 3.14.
+audioop-lts>=0.2; python_version >= "3.13"

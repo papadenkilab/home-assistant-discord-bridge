@@ -1,0 +1,6 @@
+# Local secrets — never publish
+queue_token.txt
+
+# Python caches
+__pycache__/
+.pytest_cache/
