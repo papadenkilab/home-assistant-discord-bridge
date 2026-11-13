@@ -390,3 +390,16 @@ async def test_threads_requires_token_and_connection(client):
     assert r.status == 401
     r = await client.get("/threads", headers={"X-Queue-Token": TOKEN})
     assert r.status == 503
+
+
+def test_resolve_forum_tags():
+    avail = [("10", "画像"), ("11", "動画"), ("12", "md")]
+    matched, missing = bridge_mod.resolve_forum_tags(avail, ["画像", "12"])
+    assert matched == ["10", "12"] and missing == []
+    matched, missing = bridge_mod.resolve_forum_tags(avail, ["存在しない"])
+    assert matched == [] and missing == ["存在しない"]
+    matched, missing = bridge_mod.resolve_forum_tags(avail, None)
+    assert matched == [] and missing == []
+    with pytest.raises(ValueError):
+        bridge_mod.resolve_forum_tags(
+            [("10", "重複"), ("11", "重複")], ["重複"])

@@ -1,3 +1,12 @@
+## 1.3.1
+
+- `/send` and `/send_file` now return Discord errors (403/404/502
+  with detail) instead of a bare HTTP 500, and accept forum tags:
+  `tags` (names or IDs) for forum posts, resolved against the
+  forum's available tags. Unknown tags return 400 with the list of
+  available tag names, which also covers forums that require a tag
+  on every new post.
+
 ## 1.3.0
 
 - New `GET /threads` (token auth): lists active threads and archived

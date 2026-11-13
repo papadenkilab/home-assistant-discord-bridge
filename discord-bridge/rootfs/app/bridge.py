@@ -71,7 +71,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DISCORD_LIMIT = 2000
 # Discord's per-file upload cap for bots in normal channels is 25 MB.
 MAX_FILE_SIZE = 25 * 1024 * 1024
@@ -176,6 +176,33 @@ def forum_post_title(content, title=None):
         if not name:
             name = "post"
     return name[:100]
+
+
+def resolve_forum_tags(available, wanted):
+    """Resolve requested forum tags (names or IDs) against a forum's
+    available tags, given as (id, name) pairs.
+
+    Returns (matched_ids, missing). Raises ValueError when a wanted
+    name matches more than one tag.
+    """
+    by_id = {str(i): str(i) for i, _ in available}
+    by_name = {}
+    for i, n in available:
+        by_name.setdefault(str(n), []).append(str(i))
+    matched, missing = [], []
+    for w in wanted or []:
+        w = str(w).strip()
+        if not w:
+            continue
+        if w in by_id:
+            matched.append(w)
+        elif w in by_name:
+            if len(by_name[w]) > 1:
+                raise ValueError("tag name %r is ambiguous" % w)
+            matched.append(by_name[w][0])
+        else:
+            missing.append(w)
+    return matched, missing
 
 
 # ---------------------------------------------------------------- queue
@@ -379,8 +406,22 @@ class Bridge:
     def discord_connected(self):
         return bool(self.client and self.client.is_ready())
 
+    async def _forum_applied_tags(self, channel, tags):
+        """Resolve requested tag names/IDs to ForumTag objects."""
+        if not tags:
+            return None
+        available = [(str(t.id), t.name) for t in channel.available_tags]
+        matched, missing = resolve_forum_tags(available, tags)
+        if missing:
+            raise ValueError(
+                "unknown forum tag(s): %s (available: %s)"
+                % (", ".join(missing),
+                   ", ".join(n for _, n in available)))
+        by_id = {str(t.id): t for t in channel.available_tags}
+        return [by_id[i] for i in matched]
+
     async def send_to_discord(self, channel_id, content, in_reply_to=None,
-                              title=None):
+                              title=None, tags=None):
         """Returns the last sent message id (str). Raises if not connected.
 
         Forum channels have no plain send: the content becomes a new
@@ -394,10 +435,14 @@ class Bridge:
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
         if isinstance(channel, discord.ForumChannel):
+            applied = await self._forum_applied_tags(channel, tags)
+            kwargs = {}
+            if applied:
+                kwargs["applied_tags"] = applied
             chunks = split_content(content)
             created = await channel.create_post(
                 name=forum_post_title(content, title),
-                content=chunks[0] if chunks else "")
+                content=chunks[0] if chunks else "", **kwargs)
             thread = created.thread
             last_id = str(created.message.id) if created.message \
                 else str(thread.id)
@@ -418,7 +463,8 @@ class Bridge:
         return last_id
 
     async def send_file_to_discord(self, channel_id, content, filename,
-                                   data, in_reply_to=None, title=None):
+                                   data, in_reply_to=None, title=None,
+                                   tags=None):
         """Send one file attachment, with optional text alongside.
 
         Returns the sent message id (str). Raises if not connected.
@@ -436,12 +482,16 @@ class Bridge:
         if channel is None:
             channel = await self.client.fetch_channel(int(channel_id))
         if isinstance(channel, discord.ForumChannel):
+            applied = await self._forum_applied_tags(channel, tags)
+            kwargs = {}
+            if applied:
+                kwargs["applied_tags"] = applied
             attach = discord.File(io.BytesIO(data),
                                   filename=os.path.basename(filename)
                                   or "attachment")
             created = await channel.create_post(
                 name=forum_post_title(content, title),
-                content=content or None, file=attach)
+                content=content or None, file=attach, **kwargs)
             return str(created.message.id) if created.message \
                 else str(created.thread.id)
         chunks = split_content(content) if content else []
@@ -547,6 +597,7 @@ def create_app(bridge):
         dedupe_id = body.get("dedupe_id", "")
         in_reply_to = body.get("in_reply_to")
         title = body.get("title")
+        tags = body.get("tags")
         if not channel_id or not content or not dedupe_id:
             return web.json_response(
                 {"error": "channel_id, content and dedupe_id are required"},
@@ -565,8 +616,14 @@ def create_app(bridge):
             q.outbox_put(dedupe_id, channel_id, content, fake_id, status="simulated")
             return web.json_response(
                 {"sent_message_id": fake_id, "status": "simulated"})
-        sent_id = await bridge.send_to_discord(
-            channel_id, content, in_reply_to, title=title)
+        try:
+            sent_id = await bridge.send_to_discord(
+                channel_id, content, in_reply_to, title=title, tags=tags)
+        except ValueError as exc:
+            return web.json_response(
+                {"error": "bad_request", "detail": str(exc)}, status=400)
+        except Exception as exc:
+            return discord_error_response(exc)
         q.outbox_put(dedupe_id, channel_id, content, sent_id, status="sent")
         return web.json_response({"sent_message_id": sent_id, "status": "sent"})
 
@@ -608,7 +665,7 @@ def create_app(bridge):
                                 status=400)
                     data = bytes(buf)
                 elif part.name in ("channel_id", "content", "dedupe_id",
-                                   "in_reply_to", "title"):
+                                   "in_reply_to", "title", "tags"):
                     fields[part.name] = (await part.text()).strip()
         except web.HTTPRequestEntityTooLarge:
             return web.json_response(
@@ -638,9 +695,19 @@ def create_app(bridge):
             return web.json_response(
                 {"sent_message_id": fake_id, "status": "simulated",
                  "filename": filename, "size": len(data)})
-        sent_id = await bridge.send_file_to_discord(
-            channel_id, content, filename, data, in_reply_to,
-            title=fields.get("title") or None)
+        file_tags = None
+        if fields.get("tags"):
+            file_tags = [t.strip() for t in fields["tags"].split(",")
+                         if t.strip()]
+        try:
+            sent_id = await bridge.send_file_to_discord(
+                channel_id, content, filename, data, in_reply_to,
+                title=fields.get("title") or None, tags=file_tags)
+        except ValueError as exc:
+            return web.json_response(
+                {"error": "bad_request", "detail": str(exc)}, status=400)
+        except Exception as exc:
+            return discord_error_response(exc)
         q.outbox_put(dedupe_id, channel_id, content, sent_id, status="sent")
         return web.json_response(
             {"sent_message_id": sent_id, "status": "sent",
